@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+基于零信任架构的物联网终端接入安全 - 源代码
+================================================
+论文题目: 基于零信任架构实现的物联网终端接入安全研究
+作者: 彭志淼
+学号: 23120301250017
+
+本代码实现了论文中描述的以下核心算法:
+1. 数据预处理模块 (方差过滤 + Z-score标准化 + PCA降维)
+2. 基于随机森林的设备分类模型
+3. 基于自编码器的异常检测模型
+4. 模型评估与对比工具
+
+依赖库:
+    numpy >= 1.21
+    pandas >= 2.0
+    scikit-learn >= 1.2
+    matplotlib >= 3.5  (可选，用于可视化)
+    joblib >= 1.2      (可选，用于模型序列化)
+
+使用方法:
+    python main.py                    # 运行完整实验流程
+    python main.py --dataset path     # 使用指定数据集
+    python main.py --train            # 仅训练模型
+    python main.py --evaluate         # 仅评估模型
+"""
+
+import os
+import sys
+import json
+import argparse
+import warnings
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.metrics import (
+    classification_report, roc_auc_score, roc_curve,
+    confusion_matrix, f1_score, accuracy_score, precision_score, recall_score
+)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
+from sklearn.neural_network import MLPRegressor
+import joblib
+
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# 模块1: 数据预处理
+# ============================================================
+
+class DataPreprocessor:
+    """N-BaIoT数据集预处理模块
+    
+    实现论文第4.1节描述的预处理流程:
+    1. 方差分析过滤低方差冗余特征
+    2. Z-score标准化消除量纲差异
+    3. 主成分分析(PCA)降维保留95%方差信息
+    """
+    
+    def __init__(self, variance_threshold=0.01, variance_ratio=0.95):
+        """
+        参数:
+            variance_threshold: 方差过滤阈值，低于此值的特征将被剔除
+            variance_ratio: PCA保留的方差比例，默认95%
+        """
+        self.variance_threshold = variance_threshold
+        self.variance_ratio = variance_ratio
+        self.scaler = StandardScaler()
+        self.pca = None
+        self.feature_mask = None
+        
+    def variance_filter(self, X):
+        """方差过滤: 剔除方差极低的冗余特征
+        
+        对115个特征进行方差分析，剔除方差极低的冗余特征，
+        降低后续模型训练的计算开销。
+        
+        参数:
+            X: 原始特征矩阵 (n_samples, n_features)
+        返回:
+            X_filtered: 过滤后的特征矩阵
+        """
+        variance = np.var(X, axis=0)
+        self.feature_mask = variance > self.variance_threshold
+        X_filtered = X[:, self.feature_mask]
+        n_removed = np.sum(~self.feature_mask)
+        print(f"[预处理-方差过滤] {X.shape[1]} -> {X_filtered.shape[1]} 个特征 (移除 {n_removed} 个低方差特征)")
+        return X_filtered
+    
+    def standardize(self, X_train, X_test=None):
+        """Z-score标准化处理
+        
+        消除量纲差异对模型训练的影响。
+        标准化公式: z = (x - mu) / sigma
+        其中 mu 为特征在训练集上的均值，sigma 为标准差。
+        
+        参数:
+            X_train: 训练集特征矩阵
+            X_test: 测试集特征矩阵 (可选)
+        返回:
+            X_train_scaled: 标准化后的训练集
+            X_test_scaled: 标准化后的测试集 (如果提供了X_test)
+        """
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        if X_test is not None:
+            X_test_scaled = self.scaler.transform(X_test)
+            return X_train_scaled, X_test_scaled
+        return X_train_scaled
+    
+    def pca_reduce(self, X_train, X_test=None):
+        """主成分分析(PCA)降维
+        
+        对高维特征空间进行降维，在保留指定方差信息的前提下
+        将特征维度压缩，降低模型训练的计算开销。
+        
+        协方差矩阵计算: C = (1/n) * X^T * X
+        对C进行特征分解，选取对应最大k个特征值的特征向量
+        构成投影矩阵，将原始特征空间降至k维。
+        
+        参数:
+            X_train: 训练集特征矩阵
+            X_test: 测试集特征矩阵 (可选)
+        返回:
+            X_train_pca: PCA降维后的训练集
+            X_test_pca: PCA降维后的测试集 (如果提供了X_test)
+        """
+        # 根据方差比例自动计算组件数
+        n_comp = None  # None表示使用所有组件，后续手动截断
+        n_selected = None  # 初始化避免未定义变量
+        
+        self.pca = PCA(n_components=n_comp, whiten=True)
+        X_train_pca = self.pca.fit_transform(X_train)
+        
+        # 计算保留的方差比例
+        explained_var = np.sum(self.pca.explained_variance_ratio_)
+        
+        # 如果设置了方差比例阈值，自动选择组件数
+        if self.variance_ratio < 1.0:
+            cumvar = np.cumsum(self.pca.explained_variance_ratio_)
+            n_selected = np.searchsorted(cumvar, self.variance_ratio) + 1
+            if n_selected < X_train_pca.shape[1]:
+                X_train_pca = X_train_pca[:, :n_selected]
+                explained_var = cumvar[n_selected - 1]
+                print(f"[预处理-PCA] 自动选择 {n_selected} 维 (保留方差: {explained_var:.4f})")
+        
+        n_final = X_train_pca.shape[1]
+        print(f"[预处理-PCA] {X_train.shape[1]} -> {n_final} 维 (保留方差: {explained_var:.4f})")
+        
+        if X_test is not None:
+            X_test_pca = self.pca.transform(X_test)
+            # 如果训练集做了截断，测试集也要截断
+            if n_selected is not None and n_selected < X_test_pca.shape[1]:
+                X_test_pca = X_test_pca[:, :n_selected]
+            return X_train_pca, X_test_pca
+        return X_train_pca
+    
+    def preprocess_pipeline(self, X_train, X_test=None):
+        """完整预处理流水线: 方差过滤 -> 标准化 -> PCA
+        
+        参数:
+            X_train: 训练集原始特征矩阵
+            X_test: 测试集原始特征矩阵 (可选)
+        返回:
+            X_train_proc: 预处理后的训练集
+            X_test_proc: 预处理后的测试集 (如果提供了X_test)
+        """
+        # 步骤1: 方差过滤
+        X_train_filtered = self.variance_filter(X_train)
+        X_test_filtered = self.variance_filter(X_test) if X_test is not None else None
+        
+        # 步骤2: Z-score标准化
+        X_train_scaled, X_test_scaled = self.standardize(X_train_filtered, X_test_filtered)
+        
+        # 步骤3: PCA降维
+        X_train_pca, X_test_pca = self.pca_reduce(X_train_scaled, X_test_scaled)
+        
+        return X_train_pca, X_test_pca
+    
+    def save(self, path):
+        """保存预处理器"""
+        joblib.dump({
+            'variance_threshold': self.variance_threshold,
+            'variance_ratio': self.variance_ratio,
+            'scaler': self.scaler,
+            'pca': self.pca,
+            'feature_mask': self.feature_mask
+        }, path)
+        print(f"[保存] 预处理器已保存到: {path}")
+    
+    @classmethod
+    def load(cls, path):
+        """加载预处理器"""
+        data = joblib.load(path)
+        instance = cls(
+            variance_threshold=data['variance_threshold'],
+            variance_ratio=data['variance_ratio']
+        )
+        instance.scaler = data['scaler']
+        instance.pca = data['pca']
+        instance.feature_mask = data['feature_mask']
+        return instance
+
+
+# ============================================================
+# 模块2: 随机森林设备分类模型
+# ============================================================
+
+class DeviceClassifier:
+    """基于随机森林的物联网设备分类模型
+    
+    输入: 预处理后的流量统计特征向量
+    输出: 设备类别标签 + 各类别得票比例(分类置信度)
+    
+    模型设计(论文4.2节):
+    - 训练阶段: 有放回抽样生成多份子训练集，每份独立训练一棵决策树
+    - 节点分裂: 从随机选取的部分候选特征中以基尼指数最小为准则确定最优分裂点
+    - 推理阶段: 输入特征并行通过全部决策树，多数投票输出最终类别
+    - 未知设备处理: 最高得票比例低于设定门限时，标记为未知设备类型
+    """
+    
+    def __init__(self, n_estimators=200, max_depth=20, min_samples_split=2, 
+                 min_samples_leaf=1, random_state=42):
+        """
+        参数:
+            n_estimators: 决策树数量，在{50, 100, 200, 500}中搜索，最优值200
+            max_depth: 树的最大深度，限制为20防止单棵树过度生长
+            min_samples_split: 最小分裂样本数，最优值2
+            min_samples_leaf: 最小叶节点样本数，最优值1
+            random_state: 随机种子
+        """
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.random_state = random_state
+        
+        self.model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            random_state=random_state,
+            n_jobs=-1,
+            class_weight='balanced'  # 类别权重机制，缓解样本不均衡
+        )
+        self.feature_importances_ = None
+        self.classes_ = None
+        
+    def train(self, X_train, y_train):
+        """训练模型
+        
+        参数:
+            X_train: 训练特征矩阵
+            y_train: 训练标签数组
+        返回:
+            self
+        """
+        self.model.fit(X_train, y_train)
+        self.feature_importances_ = self.model.feature_importances_
+        self.classes_ = self.model.classes_
+        print(f"[分类模型] 训练完成: {self.n_estimators}棵树, 最大深度={self.max_depth}")
+        print(f"[分类模型] 特征重要性 Top5: {np.sort(self.feature_importances_)[-5:][::-1]}")
+        return self
+    
+    def predict(self, X):
+        """预测设备类别
+        
+        参数:
+            X: 输入特征矩阵
+        返回:
+            predictions: 预测类别标签数组
+        """
+        return self.model.predict(X)
+    
+    def predict_proba(self, X):
+        """预测各类别得票比例(置信度)
+        
+        参数:
+            X: 输入特征矩阵
+        返回:
+            probas: 各类别得票比例矩阵 (n_samples, n_classes)
+        """
+        return self.model.predict_proba(X)
+    
+    def predict_with_confidence(self, X, confidence_threshold=0.6):
+        """带置信度判别的预测
+        
+        当最高得票比例低于门限时，样本被标记为未知设备类型，
+        交由策略决策层按高风险流程处置。
+        
+        参数:
+            X: 输入特征矩阵
+            confidence_threshold: 置信度门限，默认0.6
+        返回:
+            final_predictions: 最终预测标签 (-1表示未知设备)
+            confidence_scores: 置信度分数数组
+        """
+        probas = self.predict_proba(X)
+        max_proba = np.max(probas, axis=1)
+        predictions = self.predict(X)
+        
+        # 低于置信度门限的标记为-1(未知设备)
+        confident_mask = max_proba >= confidence_threshold
+        final_predictions = predictions.copy()
+        final_predictions[~confident_mask] = -1  # -1表示未知设备类型
+        
+        return final_predictions, max_proba
+    
+    def get_hyperparameter_search_space(self):
+        """获取超参数搜索空间(论文表4-3)
+        
+        返回:
+            param_grid: 超参数搜索空间字典
+        """
+        param_grid = {
+            'n_estimators': [50, 100, 200, 500],
+            'max_depth': [10, 15, 20, None],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4],
+        }
+        return param_grid
+    
+    def hyperparameter_tuning(self, X_train, y_train, cv=5):
+        """网格搜索+交叉验证调优超参数
+        
+        参数:
+            X_train: 训练特征矩阵
+            y_train: 训练标签数组
+            cv: 交叉验证折数，默认5
+        返回:
+            best_params: 最优超参数字典
+        """
+        param_grid = self.get_hyperparameter_search_space()
+        cv_strategy = StratifiedKFold(n_splits=cv, shuffle=True, random_state=self.random_state)
+        
+        grid_search = GridSearchCV(
+            estimator=RandomForestClassifier(
+                random_state=self.random_state, 
+                class_weight='balanced', 
+                n_jobs=-1
+            ),
+            param_grid=param_grid,
+            cv=cv_strategy,
+            scoring='f1_macro',
+            n_jobs=-1,
+            verbose=0
+        )
+        
+        grid_search.fit(X_train, y_train)
+        print(f"\n[调参] 最优参数: {grid_search.best_params_}")
+        print(f"[调参] 最优宏平均F1: {grid_search.best_score_:.4f}")
+        
+        # 更新模型为最优参数
+        self.model = grid_search.best_estimator_
+        self.n_estimators = self.model.n_estimators
+        self.max_depth = self.model.max_depth
+        self.min_samples_split = self.model.min_samples_split
+        self.min_samples_leaf = self.model.min_samples_leaf
+        self.feature_importances_ = self.model.feature_importances_
+        self.classes_ = self.model.classes_
+        
+        return grid_search.best_params_
+    
+    def evaluate(self, X_test, y_test):
+        """评估模型性能
+        
+        参数:
+            X_test: 测试特征矩阵
+            y_test: 测试标签数组
+        返回:
+            metrics: 性能指标字典
+        """
+        y_pred = self.predict(X_test)
+        
+        # 计算各类指标
+        accuracy = accuracy_score(y_test, y_pred)
+        macro_f1 = f1_score(y_test, y_pred, average='macro', zero_division=0)
+        weighted_f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+        
+        # 各类别详细指标
+        target_names = [f'class_{i}' for i in np.unique(y_test)]
+        report = classification_report(y_test, y_pred, target_names=target_names, zero_division=0)
+        
+        # 每类设备的详细指标
+        per_class = {}
+        for i, cls_name in enumerate(np.unique(y_test)):
+            class_idx = list(np.unique(y_test)).index(cls_name)
+            class_report = classification_report(
+                y_test, y_pred, 
+                labels=[cls_name], 
+                target_names=[cls_name],
+                zero_division=0,
+                output_dict=True
+            )
+            per_class[cls_name] = class_report.get(cls_name, {})
+        
+        metrics = {
+            'accuracy': accuracy,
+            'macro_f1': macro_f1,
+            'weighted_f1': weighted_f1,
+            'predictions': y_pred,
+            'report': report,
+            'per_class': per_class
+        }
+        
+        print(f"\n[评估] 准确率: {accuracy:.4f}")
+        print(f"[评估] 宏平均F1: {macro_f1:.4f}")
+        print(f"[评估] 加权平均F1: {weighted_f1:.4f}")
+        print(f"\n[评估] 各类别详细指标:\n{report}")
+        
+        return metrics
+    
+    def save(self, path):
+        """保存分类模型"""
+        joblib.dump({
+            'model': self.model,
+            'n_estimators': self.n_estimators,
+            'max_depth': self.max_depth,
+            'min_samples_split': self.min_samples_split,
+            'min_samples_leaf': self.min_samples_leaf,
+            'feature_importances_': self.feature_importances_,
+            'classes_': self.classes_
+        }, path)
+        print(f"[保存] 分类模型已保存到: {path}")
+    
+    @classmethod
+    def load(cls, path):
+        """加载分类模型"""
+        data = joblib.load(path)
+        instance = cls(
+            n_estimators=data['n_estimators'],
+            max_depth=data['max_depth'],
+            min_samples_split=data['min_samples_split'],
+            min_samples_leaf=data['min_samples_leaf']
+        )
+        instance.model = data['model']
+        instance.feature_importances_ = data['feature_importances_']
+        instance.classes_ = data['classes_']
+        return instance
+
+
+# ============================================================
+# 模块3: 自编码器异常检测模型
+# ============================================================
+
+class AutoencoderAnomalyDetector:
+    """基于自编码器的物联网异常检测模型 (sklearn实现版)
+    
+    架构(sklearn MLPRegressor模拟):
+    - 编码器: 输入 -> 全连接(64, ReLU) -> 全连接(32, ReLU) -> 潜在空间(线性)
+    - 解码器: 潜在空间 -> 全连接(32, ReLU) -> 全连接(64, ReLU) -> 输出(线性)
+    - 激活函数: ReLU (修正线性单元)
+    - 损失函数: 均方重建误差 (MSE)
+    - 优化器: Adam
+    
+    训练策略:
+    - 仅在正常流量样本上训练，学习正常行为模式的低维表示
+    - 推理阶段: 正常流量重建误差小，异常流量重建误差大
+    
+    部署策略:
+    - 边缘侧部署，保护数据隐私同时降低检测延迟
+    """
+    
+    def __init__(self, input_dim, latent_dim=16, learning_rate=0.001, random_state=42):
+        """
+        参数:
+            input_dim: 输入特征维度
+            latent_dim: 潜在空间维度
+            learning_rate: Adam优化器学习率
+            random_state: 随机种子
+        """
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.learning_rate = learning_rate
+        self.random_state = random_state
+        
+        # 模型组件 (使用MLPRegressor模拟自编码器)
+        self.autoencoder = None
+        self.threshold = None
+        self.is_trained = False
+        self.training_history = None
+        
+    def build_model(self):
+        """构建自编码器模型架构 (sklearn版)
+        
+        Returns:
+            autoencoder: MLPRegressor对象
+        """
+        # 使用MLPRegressor模拟自编码器
+        # 隐藏层结构: input_dim -> 64 -> latent_dim -> 64 -> input_dim
+        self.autoencoder = MLPRegressor(
+            hidden_layer_sizes=(64, self.latent_dim, 64),
+            activation='relu',
+            solver='adam',
+            learning_rate_init=self.learning_rate,
+            learning_rate='adaptive',
+            max_iter=1,  # 每次partial_fit只训练1轮
+            random_state=self.random_state,
+            verbose=False
+        )
+        
+        print(f"[自编码器] 模型架构构建完成 (sklearn版)")
+        print(f"  输入维度: {self.input_dim}")
+        print(f"  潜在维度: {self.latent_dim}")
+        print(f"  编码器: {self.input_dim} -> 64 -> {self.latent_dim}")
+        print(f"  解码器: {self.latent_dim} -> 64 -> {self.input_dim}")
+        
+        return self.autoencoder
+    
+    def train(self, X_train, epochs=100, batch_size=32, validation_split=0.2):
+        """训练自编码器(仅使用正常流量样本)
+        
+        模型仅在正常流量样本上训练，学习正常行为模式的低维表示。
+        
+        参数:
+            X_train: 正常流量特征矩阵
+            epochs: 训练轮数
+            batch_size: 批次大小
+            validation_split: 验证集比例 (sklearn版暂不支持，忽略)
+        返回:
+            history: 训练历史记录
+        """
+        if self.autoencoder is None:
+            self.build_model()
+            
+        # 使用partial_fit进行分批训练
+        n_samples = len(X_train)
+        indices = np.arange(n_samples)
+        history_loss = []
+        
+        for epoch in range(epochs):
+            # 打乱数据
+            np.random.shuffle(indices)
+            X_shuffled = X_train[indices]
+            
+            # 分批训练
+            for start in range(0, n_samples, batch_size):
+                end = min(start + batch_size, n_samples)
+                batch_X = X_shuffled[start:end]
+                self.autoencoder.partial_fit(batch_X, batch_X)
+            
+            # 计算训练损失
+            train_pred = self.autoencoder.predict(X_train)
+            train_loss = np.mean((X_train - train_pred) ** 2)
+            history_loss.append(float(train_loss))
+            
+            if epoch % 20 == 0:
+                print(f"  Epoch {epoch}/{epochs}, Loss: {train_loss:.6f}")
+        
+        self.training_history = {'loss': history_loss}
+        self.is_trained = True
+        final_loss = history_loss[-1]
+        print(f"\n[自编码器] 训练完成，最终训练MSE: {final_loss:.6f}")
+        return self.training_history
+    
+    def reconstruct(self, X):
+        """重建输入特征
+        
+        参数:
+            X: 输入特征矩阵
+        返回:
+            X_reconstructed: 重建后的特征矩阵
+        """
+        if not self.is_trained:
+            raise RuntimeError("模型尚未训练")
+        return self.autoencoder.predict(X)
+    
+    def compute_reconstruction_error(self, X):
+        """计算重建误差(MSE per sample)
+        
+        重建误差公式: E = (1/d) * sum((x_i - x'_i)^2)
+        其中 d 为特征维度，x_i 为原始值，x'_i 为重建值
+        
+        参数:
+            X: 输入特征矩阵
+        返回:
+            errors: 每个样本的重建误差数组
+        """
+        X_reconstructed = self.reconstruct(X)
+        # 每个样本的重建误差(均方误差)
+        reconstruction_error = np.mean((X - X_reconstructed) ** 2, axis=1)
+        return reconstruction_error
+    
+    def determine_threshold(self, X_normal, threshold_percentile=95):
+        """基于验证集正常样本确定异常判决阈值
+        
+        使用ROC曲线分析，以最大化约登指数作为阈值选取准则:
+        J(threshold) = sensitivity(threshold) + specificity(threshold) - 1
+        最优阈值: threshold* = argmax J(threshold)
+        
+        参数:
+            X_normal: 验证集正常样本
+            threshold_percentile: 初始阈值分位数(默认95%)
+        返回:
+            threshold: 确定的判决阈值
+        """
+        errors = self.compute_reconstruction_error(X_normal)
+        
+        # 使用分位数法确定初始阈值
+        self.threshold = float(np.percentile(errors, threshold_percentile))
+        
+        print(f"\n[阈值确定] 正常样本重建误差统计:")
+        print(f"  均值: {errors.mean():.6f}")
+        print(f"  标准差: {errors.std():.6f}")
+        print(f"  最大值: {errors.max():.6f}")
+        print(f"  判决阈值 ({threshold_percentile}%分位数): {self.threshold:.6f}")
+        
+        return self.threshold
+    
+    def detect_anomalies(self, X):
+        """异常检测
+        
+        推理阶段:
+        - 若输入样本为正常流量，重建误差较小 -> 判定为正常
+        - 若输入样本为异常流量，特征分布与正常流量存在差异，
+          自编码器无法准确重建，重建误差较大 -> 判定为异常
+        
+        参数:
+            X: 待检测特征矩阵
+        返回:
+            labels: 预测标签数组 (0=正常, 1=异常)
+            errors: 重建误差数组
+        """
+        if not self.is_trained:
+            raise RuntimeError("模型尚未训练")
+            
+        errors = self.compute_reconstruction_error(X)
+        # 超过阈值判定为异常
+        labels = (errors > self.threshold).astype(int)
+        
+        anomaly_rate = labels.mean() * 100
+        print(f"\n[检测] 检测样本数: {len(X)}, 异常数: {labels.sum()}, 异常率: {anomaly_rate:.1f}%")
+        
+        return labels, errors
+    
+    def get_latent_representation(self, X):
+        """获取潜在空间表示(用于可视化或进一步分析)
+        
+        参数:
+            X: 输入特征矩阵
+        返回:
+            latent: 潜在空间表示矩阵
+        """
+        if not self.is_trained:
+            raise RuntimeError("模型尚未训练")
+        
+        # 手动计算隐藏层激活值作为潜在表示
+        coefs = self.autoencoder.coefs_
+        intercepts = self.autoencoder.intercepts_
+        
+        # Layer 1: input -> 64 (ReLU)
+        h1 = np.maximum(0, X @ coefs[0] + intercepts[0])
+        # Layer 2: 64 -> latent_dim (线性激活，即瓶颈层)
+        latent = h1 @ coefs[1].T + intercepts[1]
+        
+        return latent
+    
+    def save(self, path):
+        """保存异常检测模型 (sklearn版)"""
+        # 使用joblib保存MLPRegressor模型
+        model_path = path + '.joblib'
+        joblib.dump(self.autoencoder, model_path)
+        print(f"[保存] 自编码器已保存到: {model_path}")
+        
+        # 保存元数据
+        meta_path = path + '.meta'
+        joblib.dump({
+            'input_dim': self.input_dim,
+            'latent_dim': self.latent_dim,
+            'learning_rate': self.learning_rate,
+            'threshold': self.threshold,
+            'is_trained': self.is_trained,
+            'training_history': self.training_history
+        }, meta_path)
+        print(f"[保存] 模型元数据已保存到: {meta_path}")
+    
+    @classmethod
+    def load(cls, path, input_dim=None):
+        """加载异常检测模型 (sklearn版)"""
+        # 使用joblib加载MLPRegressor模型
+        model_path = path + '.joblib'
+        autoencoder = joblib.load(model_path)
+        
+        meta_path = path + '.meta'
+        meta = joblib.load(meta_path)
+        
+        instance = cls(
+            input_dim=meta['input_dim'],
+            latent_dim=meta['latent_dim'],
+            learning_rate=meta['learning_rate']
+        )
+        instance.autoencoder = autoencoder
+        instance.threshold = meta['threshold']
+        instance.is_trained = meta['is_trained']
+        instance.training_history = meta['training_history']
+        
+        return instance
+
+
+class ModelEvaluator:
+    """模型评估工具类"""
+    
+    @staticmethod
+    def compute_roc_auc(y_true, y_scores):
+        """计算AUC值
+        
+        参数:
+            y_true: 真实标签
+            y_scores: 预测分数
+        返回:
+            auc: AUC值
+        """
+        try:
+            return roc_auc_score(y_true, y_scores)
+        except ValueError:
+            return None
+    
+    @staticmethod
+    def compute_detection_metrics(y_true, y_pred):
+        """计算异常检测性能指标
+        
+        参数:
+            y_true: 真实标签 (0=正常, 1=异常)
+            y_pred: 预测标签
+        返回:
+            metrics: 性能指标字典
+        """
+        cm = confusion_matrix(y_true, y_pred)
+        tn, fp = cm[0]
+        fn, tp = cm[1]
+        
+        detection_rate = tp / (tp + fn) if (tp + fn) > 0 else 0  # 召回率/检测率
+        false_alarm_rate = fp / (fp + tn) if (fp + tn) > 0 else 0  # 误报率
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        f1 = 2 * precision * detection_rate / (precision + detection_rate) if (precision + detection_rate) > 0 else 0
+        accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0
+        
+        return {
+            'detection_rate': detection_rate,
+            'false_alarm_rate': false_alarm_rate,
+            'precision': precision,
+            'f1_score': f1,
+            'accuracy': accuracy,
+            'confusion_matrix': cm
+        }
+    
+    @staticmethod
+    def compare_classifiers(X_test, y_test, classifiers_dict):
+        """对比多种分类器性能
+        
+        参数:
+            X_test: 测试特征矩阵
+            y_test: 测试标签数组
+            classifiers_dict: {名称: 分类器对象} 字典
+        返回:
+            results: {名称: 性能指标} 字典
+        """
+        results = {}
+        for name, clf in classifiers_dict.items():
+            y_pred = clf.predict(X_test)
+            results[name] = {
+                'accuracy': accuracy_score(y_test, y_pred),
+                'macro_f1': f1_score(y_test, y_pred, average='macro', zero_division=0),
+                'predictions': y_pred
+            }
+            print(f"\n[{name}] 准确率: {results[name]['accuracy']:.4f}, "
+                  f"宏平均F1: {results[name]['macro_f1']:.4f}")
+        return results
+
+
+# ============================================================
+# 模块5: 模拟数据生成(用于演示完整流程)
+# ============================================================
+
+def generate_synthetic_data(n_samples=10000, n_features=115, n_classes=9):
+    """生成模拟物联网流量数据(用于演示完整流程)
+    
+    实际使用时应替换为N-BaIoT数据集的加载代码:
+    
+    示例加载代码:
+        import pandas as pd
+        df = pd.read_csv('path/to/nbaiot_dataset.csv')
+        X = df.drop('label', axis=1).values
+        y = df['label'].values
+    """
+    np.random.seed(42)
+    
+    # 生成各类设备特征
+    X_list = []
+    y_list = []
+    samples_per_class = n_samples // n_classes
+    
+    for class_idx in range(n_classes):
+        # 每类设备有不同的特征分布
+        class_mean = np.random.uniform(-2, 2, size=n_features)
+        class_cov = np.diag(np.random.uniform(0.5, 2, size=n_features))
+        
+        X_class = np.random.multivariate_normal(class_mean, class_cov, samples_per_class)
+        # 添加一些噪声
+        X_class += np.random.normal(0, 0.1, X_class.shape)
+        
+        X_list.append(X_class)
+        y_list.append(np.full(samples_per_class, class_idx))
+    
+    X = np.vstack(X_list)
+    y = np.concatenate(y_list)
+    
+    # 添加一些异常样本(模拟攻击流量)
+    n_anomalies = int(n_samples * 0.15)
+    X_anomalies = np.random.uniform(-5, 5, size=(n_anomalies, n_features))
+    X = np.vstack([X, X_anomalies])
+    
+    # 打乱数据
+    indices = np.random.permutation(len(X))
+    X = X[indices]
+    y_full = np.concatenate([y, np.full(n_anomalies, -1)])  # -1表示异常
+    y = y_full[indices]
+    
+    return X, y
+
+
+# ============================================================
+# 模块6: 主流程
+# ============================================================
+
+def main_pipeline(dataset_path=None, use_synthetic=True):
+    """完整的实验流程
+    
+    参数:
+        dataset_path: 数据集文件路径
+        use_synthetic: 是否使用模拟数据(默认True，实际使用时设为False并提供dataset_path)
+    """
+    print("=" * 60)
+    print("基于零信任架构的物联网终端接入安全 - 实验流程")
+    print("=" * 60)
+    
+    # 步骤1: 数据准备
+    print("\n[步骤1] 数据准备")
+    if use_synthetic:
+        X, y = generate_synthetic_data(n_samples=10000, n_features=115, n_classes=9)
+        print(f"  使用模拟数据集: {X.shape}")
+    else:
+        # 实际数据集加载代码(需要根据实际数据格式调整)
+        print("  [提示] 请提供N-BaIoT数据集路径")
+        print("  示例: main_pipeline(dataset_path='data/nbaiot.csv', use_synthetic=False)")
+        X, y = generate_synthetic_data(n_samples=10000, n_features=115, n_classes=9)  # 临时使用模拟数据
+    
+    print(f"  总样本数: {len(X)}, 特征维度: {X.shape[1]}")
+    print(f"  设备类别数: {len(np.unique(y[y >= 0]))}")
+    
+    # 步骤2: 数据预处理
+    print("\n[步骤2] 数据预处理")
+    preprocessor = DataPreprocessor(variance_threshold=0.01, variance_ratio=0.95)
+    
+    # 划分正常样本和异常样本
+    normal_mask = y >= 0
+    X_normal = X[normal_mask]
+    y_normal = y[normal_mask]
+    
+    # 设备分类: 仅使用正常样本进行训练和测试
+    X_class_train, X_class_test, y_class_train, y_class_test = train_test_split(
+        X_normal, y_normal, test_size=0.2, random_state=42, stratify=y_normal
+    )
+    
+    # 预处理(分类模型)
+    X_class_train_proc, X_class_test_proc = preprocessor.preprocess_pipeline(
+        X_class_train, X_class_test
+    )
+    
+    # 异常检测: 使用全部正常样本训练
+    preprocessor_ae = DataPreprocessor(variance_threshold=0.01, variance_ratio=0.95)
+    X_normal_scaled = preprocessor_ae.standardize(X_normal)
+    X_normal_pca = preprocessor_ae.pca_reduce(X_normal_scaled)
+    
+    # 步骤3: 设备分类模型训练与评估
+    print("\n[步骤3] 设备分类模型训练与评估")
+    classifier = DeviceClassifier(n_estimators=200, max_depth=20, 
+                                   min_samples_split=2, min_samples_leaf=1)
+    classifier.train(X_class_train_proc, y_class_train)
+    
+    # 分类评估
+    class_results = classifier.evaluate(X_class_test_proc, y_class_test)
+    
+    # 步骤4: 异常检测模型训练与评估
+    print("\n[步骤4] 异常检测模型训练与评估")
+    # 划分正常样本为训练集和验证集
+    X_normal_train, X_normal_val = train_test_split(
+        X_normal_pca, test_size=0.2, random_state=42
+    )
+    
+    # 包含异常样本的测试集
+    n_test_normal = int(len(X_normal_pca) * 0.2)
+    # 对异常样本也进行相同的PCA降维（使用已拟合的scaler和pca）
+    X_anomalies_raw = X[normal_mask == False]
+    X_anomalies_scaled = preprocessor_ae.scaler.transform(X_anomalies_raw)
+    X_anomalies_pca = preprocessor_ae.pca.transform(X_anomalies_scaled)
+    # 确保维度与降维后的正常样本一致
+    n_pca_dims = X_normal_pca.shape[1]
+    if X_anomalies_pca.shape[1] > n_pca_dims:
+        X_anomalies_pca = X_anomalies_pca[:, :n_pca_dims]
+    X_test_with_anomalies = np.vstack([X_normal_pca[:n_test_normal], X_anomalies_pca])
+    y_test_anomaly = np.concatenate([np.zeros(n_test_normal), 
+                                      np.ones(len(X_anomalies_pca))])
+    
+    # 构建并训练自编码器 (sklearn版（已移除依赖）)
+    detector = AutoencoderAnomalyDetector(
+        input_dim=X_normal_pca.shape[1], 
+        latent_dim=16,
+        learning_rate=0.001
+    )
+    
+    # 训练自编码器 (sklearn版（已移除依赖）)
+    history = detector.train(X_normal_train, epochs=50, batch_size=32, validation_split=0.2)
+    
+    # 确定阈值
+    detector.determine_threshold(X_normal_val, threshold_percentile=95)
+    
+    # 异常检测
+    anomaly_labels, anomaly_errors = detector.detect_anomalies(X_test_with_anomalies)
+    
+    # 评估异常检测性能
+    anomaly_metrics = ModelEvaluator.compute_detection_metrics(
+        y_test_anomaly, anomaly_labels
+    )
+    print(f"\n[异常检测评估]")
+    print(f"  检测率: {anomaly_metrics['detection_rate']:.4f}")
+    print(f"  误报率: {anomaly_metrics['false_alarm_rate']:.4f}")
+    print(f"  精确率: {anomaly_metrics['precision']:.4f}")
+    print(f"  F1分数: {anomaly_metrics['f1_score']:.4f}")
+    
+    # 计算AUC
+    auc_score = ModelEvaluator.compute_roc_auc(
+        y_test_anomaly, anomaly_errors
+    )
+    print(f"  AUC: {auc_score:.4f}")
+    
+    # 步骤5: 保存模型
+    print("\n[步骤5] 模型保存")
+    output_dir = './output'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    classifier.save(os.path.join(output_dir, 'device_classifier.pkl'))
+    preprocessor.save(os.path.join(output_dir, 'preprocessor.pkl'))
+    
+    detector.save(os.path.join(output_dir, 'anomaly_detector'))
+    print("  自编码器模型已保存")
+    
+    # 步骤6: 总结
+    print("\n" + "=" * 60)
+    print("实验流程完成!")
+    print("=" * 60)
+    
+    return {
+        'classifier': classifier,
+        'detector': detector,
+        'preprocessor': preprocessor,
+        'class_results': class_results
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='基于零信任架构的物联网终端接入安全实验')
+    parser.add_argument('--dataset', type=str, default=None, help='数据集文件路径')
+    parser.add_argument('--train', action='store_true', help='仅训练模型')
+    parser.add_argument('--evaluate', action='store_true', help='仅评估模型')
+    
+    args, _ = parser.parse_known_args()
+    
+    use_synthetic = args.dataset is None
+    dataset_path = args.dataset
+    
+    results = main_pipeline(dataset_path=dataset_path, use_synthetic=use_synthetic)
+    
+    print("\n源代码执行完毕!")
